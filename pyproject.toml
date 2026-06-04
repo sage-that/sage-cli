@@ -1,0 +1,23 @@
+[project]
+name = "sage-cli"
+version = "0.1.0"
+description = "Sage CLI — interactive thought companion for the terminal"
+authors = [{name = "sage-cli"}]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.25.0",
+    "rich>=13.0.0",
+    "prompt-toolkit>=3.0.0",
+    "pydantic-ai>=1.0.3",
+]
+
+[project.scripts]
+sage = "sage_cli.main:main_entry"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "."
