@@ -26,8 +26,8 @@ Type `/page`, `/patterns`, `/activity`, or `/explore` during a session.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SAGE_API_URL` | `https://api.dev.sagethat.com` | Backend API base URL |
-| `SAGE_COGNITO_CLIENT_ID` | — | Cognito User Pool Client ID (required for login) |
-| `SAGE_COGNITO_DOMAIN` | `sage-auth-dev.auth...` | Cognito hosted UI domain |
+| `SAGE_COGNITO_CLIENT_ID` | `72f3d84edho6neu063n4ab6cb` | Cognito User Pool Client ID |
+| `SAGE_COGNITO_DOMAIN` | `dev.auth.sagethat.com` | Cognito hosted UI domain |
 
 ## Requirements
 
