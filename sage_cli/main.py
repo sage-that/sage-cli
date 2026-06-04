@@ -10,7 +10,7 @@ Usage:
     sage --deep           # Deep analysis mode
     sage --mobile         # Concise responses (default)
     sage --debug          # Show investigation queries in detail
-    sage --local          # Connect to localhost (no auth)
+    sage --local          # Connect to localhost:8000 (still auths with dev)
     sage login            # Authenticate via browser (Google OAuth)
     sage logout           # Remove cached credentials
 
@@ -982,35 +982,31 @@ class SageCLI:
 
     async def run(self):
         # Resolve identity
-        if self.use_local_mode:
-            user_id = "anonymous"
-            token = None
-        else:
-            auth_header = get_auth_header()
-            if not auth_header:
-                self.console.print(
-                    "[red]Not logged in. Run 'sage login' or use --local for local dev.[/red]"
-                )
-                return
-            import base64
-            import json as _json
+        auth_header = get_auth_header()
+        if not auth_header:
+            self.console.print(
+                "[red]Not logged in. Run 'sage login' to authenticate.[/red]"
+            )
+            return
+        import base64
+        import json as _json
 
-            token = auth_header.replace("Bearer ", "")
-            try:
-                payload = token.split(".")[1]
-                payload += "=" * (4 - len(payload) % 4)
-                claims = _json.loads(base64.urlsafe_b64decode(payload))
-                user_id = claims.get("sub")
-                if not user_id:
-                    self.console.print(
-                        "[red]Could not extract user ID from token.[/red]"
-                    )
-                    return
-            except Exception:
+        token = auth_header.replace("Bearer ", "")
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (4 - len(payload) % 4)
+            claims = _json.loads(base64.urlsafe_b64decode(payload))
+            user_id = claims.get("sub")
+            if not user_id:
                 self.console.print(
-                    "[red]Invalid authentication token. Run 'sage login' again.[/red]"
+                    "[red]Could not extract user ID from token.[/red]"
                 )
                 return
+        except Exception:
+            self.console.print(
+                "[red]Invalid authentication token. Run 'sage login' again.[/red]"
+            )
+            return
 
         self.backend = SageBackend(
             base_url=self.api_url, user_id=user_id, auth_token=token
@@ -1121,6 +1117,8 @@ def parse_args():
         "local": "--local" in args,
     }
     api_url = os.environ.get("SAGE_API_URL", "https://api.dev.sagethat.com")
+    if flags["local"]:
+        api_url = "http://localhost:8000"
     for arg in args:
         if arg.startswith("--api-url="):
             api_url = arg.split("=", 1)[1]
