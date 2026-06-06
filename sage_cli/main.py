@@ -8,7 +8,7 @@ All agent logic runs server-side; CLI handles only rendering and input.
 Usage:
     sage                  # Standard mode
     sage --deep           # Deep analysis mode
-    sage --mobile         # Concise responses (default)
+    sage --no-mobile      # Fuller responses (concise/mobile is the default)
     sage --debug          # Show investigation queries in detail
     sage --local          # Connect to localhost:8000 (still auths with dev)
     sage login            # Authenticate via browser (Google OAuth)
@@ -82,8 +82,9 @@ EXIT_MESSAGE = "\n[bold green]👋 Take care![/bold green]"
 
 
 class EventDispatcher:
-    def __init__(self):
+    def __init__(self, debug: bool = False):
         self.handlers: Dict[str, List[Callable]] = {}
+        self.debug = debug
 
     def on(self, event_type: str, handler: Callable) -> None:
         self.handlers.setdefault(event_type, []).append(handler)
@@ -99,13 +100,94 @@ class EventDispatcher:
                     await handler(event)
                 else:
                     handler(event)
-            except Exception:
-                pass
+            except Exception as e:
+                if self.debug:
+                    print(
+                        f"[handler error] {event.get('type', '?')}: {e}",
+                        file=sys.stderr,
+                    )
 
 
 @dataclass
 class TextSegment:
     content: str = ""
+    _cache: Optional[Markdown] = None
+    _cache_len: int = -1
+
+    def rendered(self) -> Markdown:
+        """Return a cached Markdown render, re-parsing only when content grows.
+
+        ContentStream re-renders on every Live refresh. Without caching, the
+        entire transcript is re-parsed each frame; finalized segments never
+        change, so only the actively-growing tail needs reparsing.
+        """
+        if self._cache is None or self._cache_len != len(self.content):
+            self._cache = Markdown(self.content)
+            self._cache_len = len(self.content)
+        return self._cache
+
+
+@dataclass
+class ThinkingSegment:
+    """Transient 'Sage is reflecting…' shown before the first content arrives.
+
+    Cleared the moment any text or investigation appears, so it fills the dead
+    air between submit and first token (worst when an investigation runs first).
+    """
+
+    label: str = "Reflecting"
+    active: bool = True
+    _start_time: float = field(default_factory=lambda: datetime.now().timestamp())
+    DOTS = ["   ", ".  ", ".. ", "..."]
+
+    def __rich_console__(self, console, options):
+        if not self.active:
+            return
+        elapsed = datetime.now().timestamp() - self._start_time
+        dots = self.DOTS[int(elapsed * 0.5) % len(self.DOTS)]
+        yield Text.from_markup(f"  [dim]✶ {self.label}{dots}[/dim]")
+
+
+@dataclass
+class StatusSegment:
+    """A single dim/colored status line — tool activity (debug) or tool errors."""
+
+    content: str = ""
+    style: str = "dim"
+
+    def __rich_console__(self, console, options):
+        yield Text.from_markup(f"  [{self.style}]{self.content}[/{self.style}]")
+
+
+SENTIMENT_STYLE = {"POSITIVE": "green", "NEGATIVE": "yellow", "NEUTRAL": "dim"}
+
+
+@dataclass
+class ClassificationSegment:
+    """Compact chip row from `emotions_classified` — sentiment, emotions, topics.
+
+    This is the data the mobile app renders as emotion chips + the Reframe
+    affordance. The CLI previously dropped it entirely.
+    """
+
+    emotions: List[str] = field(default_factory=list)
+    sentiment: str = ""
+    needs_reframe: bool = False
+    topics: List[str] = field(default_factory=list)
+
+    def __rich_console__(self, console, options):
+        chips = []
+        if self.sentiment:
+            style = SENTIMENT_STYLE.get(self.sentiment.upper(), "dim")
+            chips.append(f"[{style}]{self.sentiment.title()}[/{style}]")
+        chips.extend(f"[cyan]{e}[/cyan]" for e in self.emotions[:5])
+        chips.extend(
+            f"[dim]{t.replace('_', ' ').title()}[/dim]" for t in self.topics[:3]
+        )
+        if self.needs_reframe:
+            chips.append("[magenta]💡 reframe available[/magenta]")
+        if chips:
+            yield Text.from_markup("  " + "  ·  ".join(chips))
 
 
 @dataclass
@@ -236,8 +318,37 @@ class DirectionSegment:
 class ContentStream:
     segments: list = field(default_factory=list)
     _investigations: Dict[str, InvestigationSegment] = field(default_factory=dict)
+    _thinking: Optional[ThinkingSegment] = None
+    _classification: Optional[ClassificationSegment] = None
+
+    def start_thinking(self, label: str = "Reflecting"):
+        self._thinking = ThinkingSegment(label=label)
+        self.segments.append(self._thinking)
+
+    def update_thinking(self, label: str):
+        if self._thinking and self._thinking.active:
+            self._thinking.label = label
+
+    def stop_thinking(self):
+        if self._thinking:
+            self._thinking.active = False
+
+    def add_status(self, content: str, style: str = "dim"):
+        self.segments.append(StatusSegment(content=content, style=style))
+
+    def add_classification(self, emotions, sentiment, needs_reframe, topics):
+        # Pinned to a fixed top slot, not appended: emotions_classified races
+        # text_delta in the no-investigation path (events are unordered), so
+        # appending would drop the chip row mid-response.
+        self._classification = ClassificationSegment(
+            emotions=emotions or [],
+            sentiment=sentiment or "",
+            needs_reframe=bool(needs_reframe),
+            topics=topics or [],
+        )
 
     def append_text(self, delta: str):
+        self.stop_thinking()
         if self.segments and isinstance(self.segments[-1], TextSegment):
             self.segments[-1].content += delta
         else:
@@ -246,6 +357,7 @@ class ContentStream:
     def start_investigation(
         self, iid, title, subtitle="", max_tool_calls=5, debug_mode=False
     ):
+        self.stop_thinking()
         seg = InvestigationSegment(
             id=iid,
             title=title,
@@ -275,9 +387,17 @@ class ContentStream:
         self.segments.append(MemorySegment(content=content, memory_type=memory_type))
 
     def __rich_console__(self, console, options):
+        # Classification chips are pinned to the top — they describe the user's
+        # thought and must not interleave with the streamed response.
+        if self._classification:
+            yield self._classification
+            yield Text("")
         for segment in self.segments:
-            if isinstance(segment, TextSegment) and segment.content.strip():
-                yield Markdown(segment.content)
+            if isinstance(segment, TextSegment):
+                if segment.content.strip():
+                    yield segment.rendered()
+            elif isinstance(segment, (ThinkingSegment, StatusSegment)):
+                yield segment
             elif isinstance(
                 segment,
                 (
@@ -306,7 +426,7 @@ class UIRenderer:
                 self.stream, title="Sage Response", border_style="cyan", padding=(1, 2)
             ),
             console=self.console,
-            refresh_per_second=2,
+            refresh_per_second=10,
             transient=False,
             vertical_overflow="visible",
         )
@@ -326,6 +446,36 @@ class UIRenderer:
     def resume(self):
         if self._live:
             self._live.start()
+
+    def on_generation_started(self, event: dict):
+        self.stream.start_thinking("Reflecting")
+
+    def on_emotions_classified(self, event: dict):
+        self.stream.add_classification(
+            event.get("emotions", []),
+            event.get("sentiment", ""),
+            event.get("needs_reframe", False),
+            event.get("topics", []),
+        )
+
+    def on_thought_created(self, event: dict):
+        if self.debug_mode:
+            tid = str(event.get("thought_id", ""))[:8]
+            self.stream.add_status(f"saved thought {tid}")
+
+    def on_tool_started(self, event: dict):
+        tool = event.get("tool_name", "")
+        # investigate has its own rich panel via investigation_started
+        if tool == "investigate":
+            return
+        self.stream.update_thinking(f"Using {tool}")
+        if self.debug_mode:
+            self.stream.add_status(f"→ {tool}")
+
+    def on_tool_error(self, event: dict):
+        self.stream.add_status(
+            f"⚠ tool error: {event.get('error', 'unknown')}", style="red"
+        )
 
     def on_text_delta(self, event: dict):
         self.stream.append_text(event.get("content", ""))
@@ -369,9 +519,9 @@ class UIRenderer:
         )
 
     def on_generation_error(self, event: dict):
-        self.stream.append_text(
-            f"\n\n**Error:** {event.get('error', 'Unknown error')}\n"
-        )
+        # generation_error uses "error"; the route's catch-all uses "message".
+        msg = event.get("error") or event.get("message") or "Unknown error"
+        self.stream.append_text(f"\n\n**Error:** {msg}\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -560,7 +710,7 @@ class SageCLI:
         self.api_url = api_url
         self.backend: Optional[SageBackend] = None
 
-        self.event_dispatcher = EventDispatcher()
+        self.event_dispatcher = EventDispatcher(debug=use_debug_mode)
         self.ui_renderer = UIRenderer(self.console, debug_mode=use_debug_mode)
         self.input_bar = InputBar(self.console)
 
@@ -570,6 +720,7 @@ class SageCLI:
         self._pending_direction: Optional[DirectionSegment] = None
         self.last_guiding_questions: List[str] = []
         self.current_session_id: Optional[str] = None
+        self._reflect_rendered: bool = False
 
         self.thought_cache: List[dict] = []
         self.thought_page: int = 1
@@ -581,13 +732,40 @@ class SageCLI:
         ed = self.event_dispatcher
         ur = self.ui_renderer
         ed.on("text_delta", ur.on_text_delta)
+        ed.on("generation_started", ur.on_generation_started)
+        ed.on("emotions_classified", ur.on_emotions_classified)
+        ed.on("thought_created", ur.on_thought_created)
+        ed.on("tool_started", ur.on_tool_started)
+        ed.on("tool_error", ur.on_tool_error)
         ed.on("investigation_started", ur.on_investigation_started)
         ed.on("investigation_query", ur.on_investigation_query)
         ed.on("investigation_complete", ur.on_investigation_complete)
+        ed.on("metadata_ready", self._on_metadata_ready)
         ed.on("reflection_offered", ur.on_reflection_offered)
         ed.on("memory_created", ur.on_memory_created)
         ed.on("generation_error", ur.on_generation_error)
+        ed.on("error", ur.on_generation_error)
         ed.on("paths_offered", self._on_paths_offered)
+
+    def _on_metadata_ready(self, event: dict):
+        # guiding_questions arrive here mid-stream, before generation_complete —
+        # render them now so reflections appear early regardless of stream timing.
+        self._render_reflect(event.get("guiding_questions", []))
+
+    def _render_reflect(self, gqs: List[str]) -> None:
+        """Render the Reflect block once per turn (idempotent).
+
+        Both metadata_ready (early) and the route-level complete event carry
+        guiding_questions; whichever lands first renders, the other is a no-op.
+        """
+        if self._reflect_rendered or not gqs:
+            return
+        self._reflect_rendered = True
+        self.last_guiding_questions = gqs
+        qmd = "\n\n---\n\n**Reflect**\n\n"
+        for i, q in enumerate(gqs, 1):
+            qmd += f"{i}. {q.strip()}\n"
+        self.ui_renderer.stream.append_text(qmd)
 
     async def _on_paths_offered(self, event: dict):
         options = event.get("options", [])
@@ -810,6 +988,122 @@ class SageCLI:
             )
         )
 
+    async def handle_explore_command(self, args: list):
+        if self.backend is None:
+            return
+        days = int(args[0]) if args and args[0].isdigit() else 7
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console,
+            transient=True,
+        ) as progress:
+            progress.add_task("🧭 Finding things to explore...", total=None)
+            try:
+                data = await self.backend.get_exploration(days=days)
+            except SageBackendError as e:
+                self.console.print(f"[red]Error: {e}[/red]")
+                return
+        self._display_exploration(data.get("prompts", []), days)
+
+    def _display_exploration(self, prompts: list, days: int):
+        if not prompts:
+            self.console.print(
+                Panel(
+                    "Nothing to explore yet — keep journaling.",
+                    title=f"🧭 Explore (Past {days} Days)",
+                    border_style="yellow",
+                    padding=(1, 2),
+                )
+            )
+            return
+        table = Table(
+            show_header=False, box=None, padding=(1, 1), expand=True, show_lines=True
+        )
+        table.add_column(width=4, no_wrap=True)
+        table.add_column(ratio=1)
+        for idx, p in enumerate(prompts, 1):
+            icon = PATTERN_ICONS.get(p.get("visual", ""), "🧭")
+            body = f"[bold]{p.get('text', '')}[/bold]"
+            if p.get("details"):
+                body += f"\n[dim]{p['details']}[/dim]"
+            opts = [o.get("label", "") for o in p.get("options", []) if o.get("label")]
+            if opts:
+                body += "\n" + "  ".join(f"[cyan]· {o}[/cyan]" for o in opts)
+            table.add_row(Text.from_markup(f"{icon} {idx}."), Text.from_markup(body))
+        self.console.print()
+        self.console.print(
+            Panel(
+                table,
+                title=f"🧭 [bold cyan]Explore[/bold cyan] [dim]({len(prompts)} prompts · past {days} days)[/dim]",
+                border_style="cyan",
+            )
+        )
+
+    async def handle_activity_command(self, args: list):
+        if self.backend is None:
+            return
+        days = int(args[0]) if args and args[0].isdigit() else 30
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console,
+            transient=True,
+        ) as progress:
+            progress.add_task("📅 Loading wellness activity...", total=None)
+            try:
+                data = await self.backend.get_wellness_calendar(days=days)
+            except SageBackendError as e:
+                self.console.print(f"[red]Error: {e}[/red]")
+                return
+        self._display_activity(data.get("days", []), days)
+
+    # GitHub-style intensity ramp for the wellness contribution graph.
+    ACTIVITY_RAMP = ["#0e4429", "#006d32", "#26a641", "#39d353"]
+
+    def _display_activity(self, cal_days: list, days: int):
+        if not cal_days:
+            self.console.print(
+                Panel(
+                    "No wellness activity recorded yet.",
+                    title=f"📅 Activity (Past {days} Days)",
+                    border_style="yellow",
+                    padding=(1, 2),
+                )
+            )
+            return
+
+        def block(score) -> str:
+            if not score:
+                return "[#2d333b]■[/#2d333b]"
+            level = min(int(score) // 25, len(self.ACTIVITY_RAMP) - 1)
+            return f"[{self.ACTIVITY_RAMP[level]}]■[/{self.ACTIVITY_RAMP[level]}]"
+
+        # Lay out 7 days per row (weeks), oldest first.
+        rows, row = [], []
+        for d in cal_days:
+            row.append(block(d.get("score")))
+            if len(row) == 7:
+                rows.append(" ".join(row))
+                row = []
+        if row:
+            rows.append(" ".join(row))
+        legend = (
+            "[dim]less[/dim] "
+            + " ".join(f"[{c}]■[/{c}]" for c in self.ACTIVITY_RAMP)
+            + " [dim]more[/dim]"
+        )
+        graph = "\n".join(rows) + f"\n\n{legend}"
+        self.console.print()
+        self.console.print(
+            Panel(
+                Text.from_markup(graph),
+                title=f"📅 [bold cyan]Activity[/bold cyan] [dim]({len(cal_days)} days)[/dim]",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
+
     async def process_thought(self, text: str, journal_prompt: Optional[str] = None):
         if self.backend is None:
             self.console.print(
@@ -823,6 +1117,7 @@ class SageCLI:
             self.pending_user_input = None
 
             async with self.ui_renderer:
+                self._reflect_rendered = False
                 if self._pending_direction:
                     self.ui_renderer.stream.segments.append(self._pending_direction)
                     self._pending_direction = None
@@ -837,26 +1132,24 @@ class SageCLI:
                         session_id=self.current_session_id,
                     ):
                         event_type = event.get("type", "")
-                        if event_type == "complete":
-                            sid = event.get("session_id")
-                            if sid:
-                                self.current_session_id = sid
+                        # Capture session_id wherever it appears (paths_offered,
+                        # complete) so multi-turn context and resume both work.
+                        if event.get("session_id"):
+                            self.current_session_id = event["session_id"]
 
                         if event_type == "paths_offered":
                             deferred_seen = True
 
                         if event_type == "complete":
-                            gqs = event.get("guiding_questions", [])
-                            if gqs:
-                                self.last_guiding_questions = gqs
-                                qmd = "\n\n---\n\n**Reflect**\n\n"
-                                for i, q in enumerate(gqs, 1):
-                                    qmd += f"{i}. {q.strip()}\n"
-                                self.ui_renderer.stream.append_text(qmd)
+                            self._render_reflect(event.get("guiding_questions", []))
 
                         await self.event_dispatcher.emit(event)
+                        # Break on the terminal events. We wait for `complete`
+                        # (not generation_complete) because the route yields
+                        # complete — carrying session_id + guiding_questions —
+                        # *after* generation_complete.
                         if event_type in (
-                            "generation_complete",
+                            "complete",
                             "generation_error",
                             "paths_offered",
                         ):
@@ -873,6 +1166,7 @@ class SageCLI:
                         return
 
                     async with self.ui_renderer:
+                        self._reflect_rendered = False
                         if self._pending_direction:
                             self.ui_renderer.stream.segments.append(
                                 self._pending_direction
@@ -887,19 +1181,17 @@ class SageCLI:
                                 user_input=self.pending_user_input,
                             ):
                                 event_type = event.get("type", "")
+                                if event.get("session_id"):
+                                    self.current_session_id = event["session_id"]
                                 if event_type == "complete":
-                                    gqs = event.get("guiding_questions", [])
-                                    if gqs:
-                                        self.last_guiding_questions = gqs
-                                        qmd = "\n\n---\n\n**Reflect**\n\n"
-                                        for i, q in enumerate(gqs, 1):
-                                            qmd += f"{i}. {q.strip()}\n"
-                                        self.ui_renderer.stream.append_text(qmd)
+                                    self._render_reflect(
+                                        event.get("guiding_questions", [])
+                                    )
                                 if event_type == "paths_offered":
                                     deferred_again = True
                                 await self.event_dispatcher.emit(event)
                                 if event_type in (
-                                    "generation_complete",
+                                    "complete",
                                     "generation_error",
                                     "paths_offered",
                                     "deferred",
@@ -1076,10 +1368,10 @@ class SageCLI:
                         await self.handle_page_command(args)
                     elif cmd == "patterns":
                         await self.handle_patterns_command(args)
-                    elif cmd in ("activity", "explore"):
-                        self.console.print(
-                            f"[yellow]/{cmd} not yet available in thin CLI mode[/yellow]"
-                        )
+                    elif cmd == "explore":
+                        await self.handle_explore_command(args)
+                    elif cmd == "activity":
+                        await self.handle_activity_command(args)
                     else:
                         self.console.print(f"[yellow]Unknown command: /{cmd}[/yellow]")
                     continue
@@ -1110,9 +1402,9 @@ def parse_args():
         return "login", {}
     if args and args[0] == "logout":
         return "logout", {}
-    flags = {
+    flags: Dict[str, Any] = {
         "deep": "--deep" in args,
-        "mobile": "--mobile" not in args or "--mobile" in args,  # default on
+        "mobile": "--no-mobile" not in args,  # concise responses; on by default
         "debug": "--debug" in args,
         "local": "--local" in args,
     }

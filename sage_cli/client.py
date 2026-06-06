@@ -144,3 +144,21 @@ class SageBackend:
         )
         response.raise_for_status()
         return response.json().get("content", {})
+
+    async def get_exploration(self, days: int = 7, count: int = 3) -> dict:
+        client = await self._get_client()
+        response = await client.get(
+            f"{self.base_url}/sage/{self.user_id}/insights/exploration",
+            params={"days": days, "count": count},
+        )
+        response.raise_for_status()
+        return response.json().get("content", {})
+
+    async def get_wellness_calendar(self, days: int = 30) -> dict:
+        client = await self._get_client()
+        response = await client.get(
+            f"{self.base_url}/sage/{self.user_id}/wellness-score/calendar",
+            params={"days": days},
+        )
+        response.raise_for_status()
+        return response.json().get("content", {})
